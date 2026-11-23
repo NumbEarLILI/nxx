@@ -1,209 +1,186 @@
 # 多 Agent 协同系统设计（含敏感任务隔离）
 
-## 1. 目标与约束
+## 1. 目标、约束与已确认的决策
 
-**目标**
+**目标**：把 opencode、Claude Code、Codex CLI、Gemini CLI、Aider 等现有 agent 工具组织起来，按任务拆分、并行、串联地协同工作，且不改造这些工具本身。
 
-- 把 opencode、Claude Code、Codex CLI、Gemini CLI、Aider 等现有 agent 工具组织起来，按任务拆分、并行、串联、互审地协同工作。
-- 不改造这些工具本身，只通过它们已有的接口（非交互 CLI、ACP、MCP）接入。
+**硬约束**：敏感任务只能交给指定的可信 agent；敏感数据及其派生结果不能流向其他 agent。
 
-**硬约束**
+**已确认的决策**
 
-- 敏感任务只能交给指定的可信 agent 执行。
-- 敏感数据（源码片段、密钥、日志、客户数据……）以及从敏感数据派生出来的结果，不能流向非可信 agent，包括不能经由“编排器自己的 LLM”或“共享上下文”间接泄漏。
+| 问题 | 决策 | 对设计的影响 |
+| --- | --- | --- |
+| 可信的依据 | 公司私有部署的模型服务 | 可信与否由“数据最终流向哪个模型服务”决定；可信区网络出口只放行该服务，agent 的模型配置由执行器固定 |
+| 敏感结果是否回流 | 不需要 | 可信区**只进不出（sealed）**：普通产物可以流入，可信区的产物、日志、摘要都不出区；不需要降级（declassify）流程 |
+| 任务类型 | 代码与非代码都有 | 工作区支持 git 仓库、普通目录、空目录三种；产物统一为输出目录中的文件，git 工作区额外产出 diff |
+| 运行形态 | 常驻服务 | 编排服务常驻，提供 HTTP API 与 webhook；每个区域运行常驻执行器，主动拉取任务 |
 
-这条约束决定了整个架构：**隔离必须在编排层强制执行，不能靠提示词让 agent“自觉”。**
+核心原则：**隔离由编排层和部署结构强制执行，不依赖提示词让 agent “自觉”。**
 
 ## 2. 总体架构
 
 ```
-                    ┌──────────────────────────────────────────┐
-                    │              控制面 (Orchestrator)          │
- 用户 / CLI / Web ─▶ │  任务 DAG 引擎 · 策略引擎 · 调度器 · 审计日志  │
-                    │  人工审批队列 · 产物仓库(带标签与 ACL)        │
-                    └───────┬─────────────────────┬──────────────┘
-                            │ 统一 Adapter 接口       │ MCP 工具（agent 反向调用）
-          ┌─────────────────┼─────────────────┐   │  submit_artifact / ask_peer /
-          ▼                 ▼                 ▼   │  request_subtask / read_artifact
-   ┌────────────┐    ┌────────────┐    ┌──────────────────────┐
-   │ 普通区 Zone  │    │ 普通区 Zone  │    │ 可信区 Trusted Zone     │
-   │ Claude Code │    │ Codex CLI  │    │ opencode + 本地/私有模型 │
-   │ 容器+worktree│    │ 容器+worktree│    │ 独立机器/容器，独立凭据   │
-   └────────────┘    └────────────┘    └──────────────────────┘
+  用户 / CLI / webhook (GitHub、GitLab、飞书……)
+                 │ HTTPS
+        ┌────────▼─────────────────────────────────────────┐
+        │ 编排服务 conductor serve（不含任何 LLM）             │
+        │  工作流 DAG · 敏感分类 · 策略检查 · 调度 · 租约与重试  │
+        │  普通产物仓库 · 事件日志 · 审计日志 (SQLite)          │
+        └───────▲───────────────────────────────▲──────────┘
+                │ 拉取任务 / 上报状态             │ 拉取任务 / 只上报状态
+                │ 上传产物与日志                  │ （产物、日志、摘要不出区）
+   ┌────────────┴───────────┐        ┌──────────┴──────────────────────┐
+   │ 普通区执行器 (general)   │        │ 可信区执行器 (trusted, sealed)     │
+   │ claude-code / codex /   │        │ opencode → 公司私有模型服务        │
+   │ gemini …                │        │ 区内产物仓库 · 本地日志            │
+   │ 工作区剔除敏感路径        │        │ 出口只放行编排服务与私有模型服务     │
+   └─────────────────────────┘        └─────────────────────────────────┘
 ```
 
-核心组件：
+- **拉取模型**：执行器主动连接编排服务认领任务，编排服务不需要能访问可信网络，可信区只需开放一条到编排服务的出站连接。
+- **区域（zone）是信任边界**：每个区域一个令牌、一个权限级别（clearance）、是否 sealed。agent 归属于区域，执行器只能替本区域的 agent 认领任务。
+- **编排服务不含 LLM**：它只做确定性的规则判断，因此不会把任务内容发给任何模型服务。
 
-| 组件 | 职责 |
-| --- | --- |
-| 任务 DAG 引擎 | 保存任务、依赖、状态；驱动执行 |
-| 策略引擎 | 根据敏感级别决定“谁能执行、谁能读结果” |
-| 调度器 | 在满足策略的 agent 中按能力、负载、成本选择 |
-| Adapter 层 | 把各种 agent 工具包装成统一接口 |
-| 产物仓库 | 存放任务输出（文本、diff、文件），每个产物带安全标签 |
-| 编排 MCP Server | 暴露给 agent 的工具，让 agent 能提交结果、请求子任务、向其他 agent 提问——所有调用都过策略引擎 |
-| 审计日志 | 记录每次派发、每次产物读取、每次降级（declassify） |
+## 3. Agent 接入
 
-## 3. Agent 接入：统一 Adapter
+执行器把每个 agent 当作一个命令行程序调用，配置一条命令模板即可接入：
 
-### 3.1 接口
-
-```ts
-interface AgentAdapter {
-  id: string;                      // "opencode-trusted"
-  capabilities: string[];          // ["code", "refactor", "review", "shell"]
-  clearance: Level;                // 该 agent 允许处理的最高敏感级别
-  run(task: TaskSpec, ws: Workspace, signal: AbortSignal): AsyncIterable<AgentEvent>;
-  cancel(runId: string): Promise<void>;
-}
-
-type AgentEvent =
-  | { type: "log"; text: string }
-  | { type: "tool_call"; name: string; args: unknown }
-  | { type: "artifact"; path: string; kind: "diff" | "file" | "report" }
-  | { type: "need_input"; question: string }       // 需要人或其他 agent 回答
-  | { type: "done"; summary: string; exitCode: number };
+```yaml
+agents:
+  opencode-private:
+    command: ["opencode", "run", "--model", "company/qwen-coder", "{prompt}"]
+    env: { OPENCODE_CONFIG: /etc/conductor/opencode-private.json }
+  claude-code:
+    command: ["claude", "-p", "{prompt}", "--permission-mode", "acceptEdits"]
+  codex:
+    command: ["codex", "exec", "--full-auto", "{prompt}"]
 ```
 
-### 3.2 三种接入方式（按优先级）
+可用占位符：`{prompt}`、`{prompt_file}`、`{workspace}`、`{inputs_dir}`、`{output_dir}`；同时注入环境变量 `CONDUCTOR_WORKSPACE`、`CONDUCTOR_INPUTS_DIR`、`CONDUCTOR_OUTPUT_DIR` 等。
 
-1. **ACP（Agent Client Protocol）**：opencode（`opencode acp`）、Gemini CLI 等已支持，基于 stdio 的 JSON-RPC，能拿到结构化的流式事件、工具调用、权限请求。首选。
-2. **非交互 CLI**：`opencode run "..."`、`claude -p ... --output-format stream-json`、`codex exec ...`、`gemini -p ...`、`aider --message ...`。Adapter 负责拼命令、解析输出、收集工作目录里的 diff。
-3. **HTTP/SDK**：工具自带 server 模式时（如 `opencode serve`）直接调 API。
+执行器为每次运行生成提示词，说明任务、工作目录、上游产物位置、交付物输出位置和验收命令。agent 的环境变量**从零构建**（只透传 `inherit_env` 白名单和该 agent 的 `env`），执行器自己的区域令牌不会进入 agent 进程。
 
-每个 agent 只需要写一个几十到一两百行的 Adapter；新工具接入不影响其他部分。
+后续可在同一接口下增加 ACP（`opencode acp` 等）适配，获得结构化事件和权限请求，见第 9 节。
 
-### 3.3 反向通道：编排 MCP Server
+## 4. 安全模型
 
-给每个 agent 挂载同一个 MCP Server（按 agent 身份鉴权），提供：
-
-- `read_artifact(id)`：读取上游产物，**策略引擎检查读者 clearance ≥ 产物标签**。
-- `submit_artifact(...)`：提交结果，自动继承标签。
-- `request_subtask(description, required_capability)`：agent 自己拆出子任务交回编排器调度。
-- `ask_peer(question, target_capability)`：向其他 agent 提问（同样过策略）。
-
-这样 agent 之间“协同”永远经过编排器中转，不存在点对点直连，隔离才可控。
-
-## 4. 安全模型（核心）
-
-### 4.1 敏感级别与标签
+### 4.1 级别
 
 ```
 L0 public < L1 internal < L2 confidential < L3 restricted
 ```
 
-- **任务**有 `level`：由用户显式标注，或由分类规则自动判定（路径规则如 `secrets/**`、`infra/prod/**`；内容规则如密钥正则、PII 检测）。自动判定只能**上调**级别，不能下调。
-- **Agent** 有 `clearance`：取决于 *工具 + 模型端点 + 运行环境* 三者整体，而不是工具名。例如“opencode + 本地 Ollama + 断网容器”可以是 L3；“opencode + 某云 API”只能算 L1。这一点很容易被忽略：可信的其实是数据最终流向的模型服务。
-- **产物**有 `label`：等于产生它的任务级别与它读过的所有输入标签的最大值（污点传播）。
+- **任务级别**：用户声明，加上分类规则自动判定——路径规则（`paths` 字段匹配 `payment/signing/**` 等）和内容规则（内置私钥、AWS key、`password=…`、身份证号、手机号检测，可自定义正则）。**只能上调，不能下调。**
+- **级别沿数据传播**：任务读取了哪些上游任务的产物（`inputs`，默认等于 `depends_on`），级别就至少是这些上游的最高级别。只有顺序依赖、不读产物时（`inputs: []`）不传播。
+- **区域权限**：取决于“工具 + 模型服务 + 运行环境”的整体。opencode 接公司私有模型服务且运行在受控网络中，才是 L3；同样的 opencode 接公共 API 只能算普通区。
 
-### 4.2 三条强制规则
+### 4.2 强制规则（编排服务实现）
 
-1. **派发规则**：任务只能派给 `clearance ≥ task.level` 的 agent。没有满足条件的 agent 时任务进入等待/人工处理，绝不降级派发。
-2. **读取规则**：agent 读取产物（`read_artifact`、挂载的文件、注入的上下文）时要求 `clearance ≥ artifact.label`。
-3. **降级规则**：高标签产物要流向低 clearance 的 agent，必须经过显式的**降级（declassify）步骤**：由可信 agent 生成脱敏摘要 + 规则扫描（密钥/PII）+ 人工审批（L3 必须人工），降级动作写入审计日志。
+1. **派发**：任务只派给 `clearance ≥ 任务级别` 且具备所需能力的 agent。没有合适的 agent 就排队，绝不降级派发。
+2. **读取**：执行器下载上游产物时，要求该产物确实是本任务的输入，且 `clearance ≥ 产物标签`；允许和拒绝都写审计日志。
+3. **只进不出**：sealed 区域上传产物、上报日志事件、上报摘要或错误文本，编排服务一律拒绝（403）。sealed 区域只能上报“成功/失败 + 退出码”。
+4. **区域固定**：读取 sealed 任务产物的下游任务，只能在同一个 sealed 区域执行（产物只存在于该区域的本地仓库）。
+5. **可信容量保护**：sealed 区域默认只接普通区处理不了的任务（级别高于所有普通区的 clearance），避免普通任务被可信 agent 抢走、产物被锁在区内、占用稀缺的可信容量。可用 `min_level` 覆盖。
 
-### 4.3 编排器自身的 LLM 也是一个“读者”
+### 4.3 运行时隔离
 
-如果用 LLM 做任务规划（拆解 DAG），它会看到任务内容，因此：
+- **工作区快照**：git 工作区不是克隆，而是从执行器本地缓存 `git archive` 导出、剔除 `workspace_exclude` 路径后重新 `git init`。被剔除的文件既不在文件树里，也不在 agent 可见的 git 历史里。目录工作区同样按规则复制。
+- **来源白名单**：`allowed_sources` 限制执行器愿意导出的仓库和目录，防止有人提交任务让普通区导出敏感仓库。
+- **网络出口（部署层，必须做）**：可信区主机只允许访问编排服务和公司私有模型服务。这是“只用私有模型”的真正保证；opencode 配置里禁用其他 provider、关闭分享和自动更新是第二道防线（见 `examples/opencode-private.json`）。
+- **凭据**：私有模型服务的密钥只存在于可信区主机；普通区执行器拿不到。
+- **进程隔离（待做）**：当前 agent 以执行器同一用户运行，能读到该用户可读的文件。生产部署应让每次运行进入独立容器或独立用户，只挂载本次运行目录，见第 9 节。
 
-- 规划器本身也要有 clearance，按同样规则检查。
-- 推荐做法：普通规划器只看到敏感任务的**元信息**（“对 `payment/` 模块做安全修复，L3”），具体拆解交给可信 agent 在可信区内完成，回传的子任务列表也带 L3 标签。
-- 或者干脆让可信 agent 兼任规划器（如果它的能力够）。
+### 4.4 已知的剩余风险
 
-### 4.4 运行时隔离（纵深防御）
+- **编排服务能看到 L3 任务的标题和描述**。它不含 LLM，不会外发，但应部署在公司内网。更严格的方案是“密封载荷”：提交方用可信区执行器的公钥加密 L3 任务正文，编排服务只存密文和元数据（第 9 节）。
+- **提示词注入**：webhook 触发的任务正文来自外部（如 issue 内容）。普通区 agent 被注入后能做的事，受限于它本来就只能看到的普通数据；可信区不应由外部 webhook 直接触发 L3 任务而不经人工确认。
+- **分类是兜底而非保证**：路径和内容规则会漏判。敏感仓库应通过 `allowed_sources` 和 `workspace_exclude` 从结构上隔离，而不是依赖分类。
 
-策略引擎是逻辑隔离，还需要物理隔离兜底：
+## 5. 任务模型与协作
 
-- **工作区**：每次运行一个独立 git worktree / 目录；敏感路径通过稀疏检出（sparse checkout）根本不进入普通区的工作区。
-- **容器/沙箱**：每个 agent 跑在独立容器中；可信区放在独立主机或独立网络段。
-- **网络出口**：可信区只允许访问其模型端点（或完全断网 + 本地模型）；普通区禁止访问可信区和产物仓库的高标签数据。
-- **凭据**：敏感凭据只注入可信区容器，普通区拿不到。
-- **合并**：敏感任务产出的代码 diff 由编排器在可信区内合并到受保护分支，不经过普通 agent 的工作区。
-
-## 5. 任务模型与协作模式
-
-### 5.1 任务定义
+### 5.1 工作流定义
 
 ```yaml
-id: t-42
-title: 修复支付回调的签名校验
-level: L3                       # 显式标注，或由分类规则推导
-requires: [code, security]
-inputs: [artifact://a-17]       # 上游产物
-depends_on: [t-40]
-review:
-  by_capability: review
-  min_reviewers: 1
-acceptance:
-  - cmd: "pnpm test payment"
+name: add-payment-method
+tasks:
+  - id: contract
+    title: 定义新支付方式的 HTTP 接口契约
+    requires: [code]
+    workspace: { type: git, source: /srv/repos/app }
+  - id: signing
+    title: 实现回调签名校验与密钥加载
+    requires: [code, security]
+    paths: [payment/signing/verify.ts]       # 命中路径规则 → L3
+    depends_on: [contract]                    # 读取 contract 的产物（L0 流入可信区，允许）
+    workspace: { type: git, source: /srv/repos/app }
+    acceptance: ["pnpm -s test payment/signing"]
+  - id: signing-review
+    title: 评审签名实现的安全性
+    requires: [review]
+    depends_on: [signing]                     # 读取 L3 产物 → 自动 L3，固定在可信区
 ```
 
-### 5.2 常用协作模式（都用 DAG 表达）
+字段：`level`、`requires`（能力）、`depends_on`、`inputs`、`paths`、`workspace`（`none` / `git` / `dir`）、`acceptance`（在工作区执行的验收命令）、`max_attempts`。
 
-- **流水线**：设计 → 实现 → 测试 → 评审，每步可以是不同 agent。
-- **并行扇出**：一个大需求拆成多个互不相交的模块，分给多个 agent 并行，最后合并。
-- **作者-评审**：A 写、B 审，B 的意见作为 A 的下一轮输入，最多 N 轮。敏感任务的评审者也必须满足 clearance。
-- **多方案择优（best-of-N）**：同一任务派给多个 agent，用测试结果或评审 agent 打分选最优。
-- **混合级别拆分**：一个需求里只有一部分敏感，例如“新增支付方式”：UI 和文档（L1）交给普通 agent，签名与密钥处理（L3）交给可信 agent，接口契约（L1，由人或可信 agent 降级发布）作为两边的共同输入。这是最能体现系统价值的模式。
+### 5.2 协作模式
 
-### 5.3 共享状态
+- **流水线**：设计 → 实现 → 测试 → 评审，每步可由不同 agent 完成。
+- **并行扇出**：互不依赖的任务同时派发给不同 agent。
+- **混合级别**：同一需求中，普通部分在普通区并行，敏感部分在可信区执行，普通产物（如接口契约）作为两边的共同输入。
+- **代码与非代码统一**：文档、调研、数据分析任务用 `none` 或 `dir` 工作区，交付物写入输出目录；代码任务用 `git` 工作区，diff 自动收集为 `changes.diff`。
 
-- 代码协作以 **git** 为载体：每个任务一个分支，编排器负责合并与冲突处理（冲突时派发“解决冲突”子任务）。
-- 非代码信息（设计说明、评审意见、测试报告）进入**产物仓库**，带标签与 ACL，不用全局共享的“黑板”或聊天记录，避免标签失控。
+### 5.3 产物
 
-## 6. 调度
+- 普通区：产物上传到编排服务，标签等于任务级别，下游按读取规则下载。
+- sealed 区：产物写入区内本地仓库（`data_dir/artifacts/<工作流>/<任务>/`），下游在同区内直接读取。多台可信执行器时该目录应放在区内共享存储上。
+- 敏感结果的最终交付（合并到受保护分支、写回内部系统）在可信区内完成，不经过编排服务。
 
-1. 过滤：`clearance ≥ level` 且 `capabilities ⊇ requires`。
-2. 排序：能力匹配度、历史成功率（按任务类型统计）、当前负载、成本。
-3. 并发控制：每个 agent 设置最大并发；可信 agent 通常只有一个，敏感任务排队，必要时允许多实例同配置的可信 agent 横向扩展。
-4. 失败处理：超时/失败重试 → 换同级别其他 agent → 进入人工队列。
+## 6. 调度与可靠性
 
-## 7. 可观测与人机协同
+1. 执行器带着各 agent 的空闲槽位认领；编排服务按工作流提交顺序遍历就绪任务（依赖全部成功），选第一个满足第 4.2 节规则的 agent。
+2. 认领时发放租约，执行器周期性心跳续约；租约过期则任务重新排队（超过 `max_attempts` 判失败）。
+3. 失败自动重试；最终失败时，下游任务标记为 `skipped`，工作流标记为失败。
+4. 每个 agent 的并发由服务端 `max_concurrency` 与执行器 `slots` 共同限制。
 
-- 实时查看每个运行的事件流（来自 Adapter 的 `AgentEvent`）。
-- 审批点：L3 任务派发前（可选）、所有降级操作、合并到受保护分支。
-- 审计日志不可篡改（追加写），记录：谁、何时、对哪个任务/产物、做了什么、依据哪条策略。日志本身也按标签控制可见性。
+## 7. 常驻服务接口
 
-## 8. 技术选型建议
-
-| 部分 | 建议 |
+| 接口 | 说明 |
 | --- | --- |
-| 语言 | TypeScript（Node）或 Python，二者 ACP/MCP SDK 都齐全 |
-| 状态存储 | 起步用 SQLite（任务、产物元数据、审计），后续可换 Postgres |
-| 产物存储 | 本地文件 + 内容哈希；可信区产物存可信区本地磁盘，编排器只存元数据 |
-| 执行隔离 | Docker/Podman；可信区单独主机或单独 rootless 用户 |
-| 编排 MCP Server | 官方 MCP SDK，按 agent 发放独立 token |
-| 前端 | 起步只做 CLI + 日志；后续加一个看板展示 DAG 与审批 |
+| `POST /api/workflows` | 提交工作流（JSON 或 YAML），返回每个任务的级别及判定原因 |
+| `GET /api/workflows[/{id}]` | 查询状态；sealed 任务只有状态和退出码 |
+| `POST /api/workflows/{id}/cancel` | 取消 |
+| `GET /api/workflows/{id}/tasks/{tid}/events` | 普通任务的运行日志 |
+| `GET /api/workflows/{id}/tasks/{tid}/artifacts/{name}` | 下载普通产物 |
+| `GET /api/audit` | 审计日志：提交、分类结果、派发、产物读取与拒绝、完成、租约过期 |
+| `POST /api/hooks/{name}` | webhook 触发：支持 GitHub `X-Hub-Signature-256` 签名或 `X-Conductor-Token`；`when` 过滤，`{{payload.x}}` 模板生成工作流 |
+| `/api/runner/*` | 执行器协议：认领、心跳、上传产物、完成、读取输入 |
 
-一个关键部署选择：**可信区运行一个轻量的“区域执行器（zone runner）”**，编排器只给它下发任务 ID 和元数据，敏感内容不经过编排器主进程。这样即使编排器本身部署在非可信环境，也不会接触 L3 数据。
+## 8. 实现现状（`src/conductor`）
 
-## 9. 分阶段落地
+| 模块 | 内容 |
+| --- | --- |
+| `models.py` | 服务配置、工作流定义与校验（重复 ID、未知依赖、环） |
+| `policy.py` | 分类规则、级别传播、派发判定 |
+| `engine.py` | 状态机、调度、租约、重试、sealed 规则、审计 |
+| `server.py` | FastAPI 服务与鉴权 |
+| `triggers.py` | webhook 验签、过滤与模板 |
+| `workspace.py` | git 快照导出、目录复制、来源白名单、diff 收集 |
+| `runner.py` | 区域执行器：认领、准备工作区、拉取输入、调用 agent、验收、收集产物、上报 |
+| `cli.py` | `conductor serve / runner / submit / status` |
 
-**阶段一：最小可用**
+测试（`tests/`）用一个假 agent 覆盖端到端流程，包括：敏感任务只进可信区、sealed 区上传被拒、下游固定、跨级别读取被拒并审计、被剔除文件不在 git 历史中、执行器令牌不进入 agent 环境、重试与跳过、租约过期、webhook。
 
-- 任务 DAG（手写 YAML）+ SQLite 状态。
-- 两个 Adapter：opencode（可信，CLI 模式）+ 另一个常用 agent（普通）。
-- 派发规则 + 读取规则 + 每任务独立 worktree。
-- 审计日志。
+## 9. 后续阶段
 
-**阶段二：协同**
+**阶段二：协同增强**
+- 作者-评审循环：评审意见作为作者下一轮输入，最多 N 轮。
+- 多方案择优：同一任务派给多个 agent，按验收结果或评审打分选优。
+- 编排 MCP 服务：让 agent 在运行中提交子任务、读取允许的产物（同样经过读取规则）。
+- 简单 Web 看板：工作流 DAG、运行日志、审计查询。
 
-- 编排 MCP Server（`read_artifact` / `submit_artifact` / `request_subtask`）。
-- 作者-评审、并行扇出、best-of-N 模式。
-- 自动敏感分类（路径 + 密钥/PII 扫描），只上调不下调。
-
-**阶段三：加固与扩展**
-
-- 容器隔离、网络出口策略、可信区 zone runner。
-- 降级流程 + 人工审批 UI。
-- ACP Adapter 替换 CLI Adapter，获得结构化事件和权限控制。
-- LLM 规划器（遵守 4.3 的规则）。
-
-## 10. 需要你确认的问题
-
-这些答案会影响细节，但不影响上述架构：
-
-1. “特定的可信 agent”可信的原因是什么——本地模型、公司私有部署的模型端点，还是运行在特定机器上？这决定 clearance 的定义方式和可信区的部署位置。
-2. 敏感任务的结果是否需要回到普通 agent 继续使用？如果需要，降级流程（第 4.2 节第 3 条）是必须的；如果不需要，可以直接把可信区做成单向“只进不出”。
-3. 协作对象主要是代码仓库，还是也包括文档、数据分析等非代码任务？
-4. 期望的使用方式：命令行一次性跑一个 DAG，还是常驻服务接收任务（如从 issue 或聊天工具触发）？
+**阶段三：加固**
+- 每次运行进入独立容器（只挂载运行目录，按区域设置网络策略）。
+- 密封载荷：L3 任务正文用可信区公钥加密，编排服务只存密文。
+- 可信区内的人工确认点：外部触发的 L3 任务、合并到受保护分支前。
+- ACP 适配器：结构化事件、细粒度工具权限。
+- 可信区内的规划 agent：在区内把敏感需求拆成子任务，子任务同样只在区内执行。

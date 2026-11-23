@@ -1,0 +1,36 @@
+# conductor submit examples/workflow-payment.yaml --wait
+# 一个需求里混合了普通任务和敏感任务：
+#   contract / ui / docs 在普通区并行；signing 只在可信区执行，
+#   signing-review 读取 signing 的产物，因此自动升为 L3 并固定在可信区。
+name: add-payment-method
+tasks:
+  - id: contract
+    title: 定义新支付方式的 HTTP 接口契约
+    description: 在 docs/api/payment.md 中描述请求、响应和错误码，不涉及签名算法与密钥。
+    requires: [code]
+    workspace: { type: git, source: /srv/repos/app }
+
+  - id: ui
+    title: 结算页新增支付方式入口
+    requires: [frontend]
+    depends_on: [contract]
+    workspace: { type: git, source: /srv/repos/app }
+    acceptance: ["pnpm -s test checkout"]
+
+  - id: user-guide
+    title: 编写面向用户的支付方式说明文档
+    requires: [docs]
+    depends_on: [contract]
+
+  - id: signing
+    title: 实现回调签名校验与密钥加载
+    requires: [code, security]
+    paths: [payment/signing/verify.ts]
+    depends_on: [contract]
+    workspace: { type: git, source: /srv/repos/app }
+    acceptance: ["pnpm -s test payment/signing"]
+
+  - id: signing-review
+    title: 评审签名实现的安全性
+    requires: [review]
+    depends_on: [signing]
