@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "company": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Company private LLM",
+      "options": {
+        "baseURL": "https://llm.internal.example.com/v1",
+        "apiKey": "{env:COMPANY_LLM_KEY}"
+      },
+      "models": {
+        "qwen-coder": { "name": "qwen-coder" }
+      }
+    }
+  },
+  "model": "company/qwen-coder",
+  "small_model": "company/qwen-coder",
+  "disabled_providers": ["opencode", "anthropic", "openai", "google"],
+  "share": "disabled",
+  "autoupdate": false
+}

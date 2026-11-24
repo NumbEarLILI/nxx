@@ -1,0 +1,26 @@
+# conductor runner --config examples/runner-general.yaml
+server: http://conductor.internal.example.com:8700
+zone: general
+token_env: CONDUCTOR_GENERAL_ZONE_TOKEN
+data_dir: /var/lib/conductor/general
+inherit_env: [PATH, HOME, LANG, ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY]
+# 导出工作区时剔除这些路径；它们既不在文件树里，也不在 git 历史里
+workspace_exclude:
+  - "secrets/**"
+  - "payment/signing/**"
+  - "infra/prod/**"
+  - "data/customers/**"
+  - "**/.env"
+allowed_sources:
+  - /srv/repos
+  - /srv/docs
+agents:
+  claude-code:
+    command: ["claude", "-p", "{prompt}", "--permission-mode", "acceptEdits"]
+    slots: 2
+  codex:
+    command: ["codex", "exec", "--full-auto", "{prompt}"]
+    slots: 2
+  gemini:
+    command: ["gemini", "-p", "{prompt}", "--yolo"]
+    slots: 2

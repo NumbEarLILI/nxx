@@ -1,0 +1,17 @@
+# 部署在可信区主机上：conductor runner --config examples/runner-trusted.yaml
+# 该主机的网络出口只放行编排服务和公司私有模型服务。
+server: http://conductor.internal.example.com:8700
+zone: trusted
+token_env: CONDUCTOR_TRUSTED_ZONE_TOKEN
+data_dir: /var/lib/conductor/trusted     # 区内产物仓库；多台可信执行器时放共享存储
+inherit_env: [PATH, HOME, LANG, COMPANY_LLM_KEY]
+allowed_sources:
+  - /srv/repos
+  - /srv/datasets
+agents:
+  opencode-private:
+    command: ["opencode", "run", "--model", "company/qwen-coder", "{prompt}"]
+    env:
+      OPENCODE_CONFIG: /etc/conductor/opencode-private.json
+    timeout: 3600
+    slots: 1

@@ -1,0 +1,62 @@
+# conductor serve --config examples/server.yaml
+data_dir: ./data/server
+admin_token_env: CONDUCTOR_ADMIN_TOKEN
+lease_seconds: 300          # 执行器失联超过该时长，任务重新排队
+max_attempts: 2
+
+zones:
+  trusted:
+    clearance: L3
+    sealed: true            # 只进不出：产物、日志、摘要都不离开该区
+    token_env: CONDUCTOR_TRUSTED_ZONE_TOKEN
+    model_endpoints: ["https://llm.internal.example.com/v1"]   # 仅用于审计记录；真正的约束靠网络出口策略
+  general:
+    clearance: L1
+    token_env: CONDUCTOR_GENERAL_ZONE_TOKEN
+
+agents:
+  - id: opencode-private
+    zone: trusted
+    capabilities: [code, review, security, docs, data]
+    max_concurrency: 1
+  - id: claude-code
+    zone: general
+    capabilities: [code, review, docs, frontend]
+    max_concurrency: 2
+  - id: codex
+    zone: general
+    capabilities: [code, test]
+    max_concurrency: 2
+  - id: gemini
+    zone: general
+    capabilities: [docs, data, research]
+    max_concurrency: 2
+
+classification:             # 只能上调任务级别，不能下调
+  builtin_detectors: true   # 私钥、AWS key、password=…、身份证号、手机号
+  paths:
+    - { glob: "secrets/**",         level: L3 }
+    - { glob: "payment/signing/**", level: L3 }
+    - { glob: "infra/prod/**",      level: L3 }
+    - { glob: "data/customers/**",  level: L3 }
+  content:
+    - { name: internal-host, pattern: '\b[a-z0-9-]+\.corp\.example\.com\b', level: L3 }
+
+triggers:
+  - name: github-issues
+    secret_env: CONDUCTOR_HOOK_SECRET
+    when:
+      payload.action: labeled
+      payload.label.name: agent
+    workflow:
+      name: "issue #{{payload.issue.number}}"
+      tasks:
+        - id: implement
+          title: "{{payload.issue.title}}"
+          description: "{{payload.issue.body}}"
+          requires: [code]
+          workspace: { type: git, source: /srv/repos/app }
+        - id: review
+          title: "Review the change for issue #{{payload.issue.number}}"
+          requires: [review]
+          depends_on: [implement]
